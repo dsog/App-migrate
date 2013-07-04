@@ -1,120 +1,136 @@
 #!/usr/bin/env perl
-
 use App::Rad;
-use DateTime;
-use Data::Dumper;
 use DBI;
 use File::Slurp qw/read_file/;
 use List::MoreUtils qw/firstidx/;
 use List::Util qw/min max/;
 
-use v5.16;
+my $DB_TABLE='migrations';
+my $CREATE_TABLE="CREATE TABLE $DB_TABLE (version INT PRIMARY KEY)";
 
-App::Rad->run();
+App::Rad->run;
 
 sub setup {
-    my $c = shift;
-
+    my ($c) = @_;
     $c->register_commands({
-            install => 'Install db_migrate_tiny',
+            #deploy => 'Deploy a specific version (default to latest)',
+            generate => 'Generate a new migration directory',
+            install => 'Install migrations table',
             latest => 'Migrate to the latest timestamp',
-            generate => 'Generate a new migration',
+            snapshot => 'Write snapshot.sql to current db version',
+            to => 'Migrate to a specific version (up or down)',
     });
 }
 
 sub pre_process {
-    my $c = shift;
+    my ($c) = @_;
 
     $c->stash->{migration_dir} = $c->options->{dir} || 'migrations';
 
-    unless ($c->cmd ~~ ['generate', 'help']){
+    unless (!$c->cmd || $c->cmd ~~ ['generate', 'help']){
         $c->getopt( 'dsn|d=s', 'user|u=s', 'pass|p=s' )
             or $c->execute('usage') and return;
 
-        my $dbh = DBI->connect($c->options->{dsn}, $c->options->{user},
-            $c->options->{pass}, { RaiseError => 1, AutoCommit => 0 });
-        $c->stash->{dbh} = $dbh;
+        $c->stash->{dbh} = DBI->connect(
+            $c->options->{dsn},
+            $c->options->{user},
+            $c->options->{pass},
+            { RaiseError => 1, AutoCommit => 0, PrintError => 0 },
+        );
     }
 }
 
 sub post_process {
-    my $c = shift;
+    my ($c) = @_;
     $c->stash->{dbh}->disconnect if $c->stash->{dbh};
+    print $c->output . "\n";
+}
+
+sub generate {
+    my ($c) = @_;
+    my $root = $c->stash->{migration_dir};
+    my @fs_versions = _fs_versions( $c );
+    my $new_version = max( @fs_versions ) + 1;
+
+    `mkdir -p $root/$new_version`;
+    `touch $root/$new_version/up.sql`;
+    `touch $root/$new_version/down.sql`;
+    return "Created migration $root/$new_version";
 }
 
 sub install {
-    my $c = shift;
-    $c->stash->{dbh}->do(
-        'CREATE TABLE db_migrate_tiny (version VARCHAR(20) PRIMARY KEY);');
+    my ($c) = @_;
+    $c->stash->{dbh}->do( $CREATE_TABLE );
     $c->stash->{dbh}->commit;
+    return "Created table $DB_TABLE.";
 }
 
 sub latest {
-    my $c = shift;
-    my $root = $c->stash->{migration_dir};
-    my @dirs = _migrations($c);
+    my ($c) = @_;
+    my @fs_versions = _fs_versions($c);
+    to( $c, max(@fs_versions) );
+}
 
-    my $rows = $c->stash->{dbh}->selectcol_arrayref(
-        'SELECT version FROM db_migrate_tiny ORDER BY version;');
-
-    my %diff;
-    @diff{ @dirs } = @dirs;
-    delete @diff{ @$rows };
-
-    my @diff = keys(%diff);
-    my $idx = firstidx{ $_ == min(@diff) } @dirs;
-    $idx = $idx ? $idx-- : $idx;
-
-    to($c, $dirs[$idx]);
-    to($c, max(@dirs));
+sub snapshot {
+    my ($c) = @_;
+    my $sth = $c->stash->{dbh}->table_info('', '%', '');
+    my $schemas = $c->stash->{dbh}->selectcol_arrayref($sth, {Columns => [2]});
+    print "Schemas: ", join ', ', @$schemas;
+    print "Tables: ", join ', ', @$schemas;
 }
 
 sub to {
     my ($c, $to_version) = @_;
     my $root = $c->stash->{migration_dir};
-    my @dirs = _migrations($c);
-    my $rows = $c->stash->{dbh}->selectcol_arrayref(
-        'SELECT version FROM db_migrate_tiny;');
-    my @versions = @$rows;
-    my $current_version = max(@versions) || '';
+    my @fs_versions = _fs_versions( $c );
+    my @db_versions = _db_versions( $c );
+    my $current_version = max(@db_versions) || 0;
+
+    $to_version = $to_version || $c->argv->[0] || max($fs_versions);
+
+    return "Invalid version number!" unless $to_version =~ /^\d+$/;
+    return "Version $to_version does not exist!"
+        unless $to_version <= max(@fs_versions);
 
     if ($current_version > $to_version){
         # Downgrade
-        for my $v (reverse @versions){
+        for my $v (reverse @db_versions){
             if ($v > $to_version){
+                print "Migrating down to " . ($v-1) . "...";
                 my $down_sql = read_file("$root/$v/down.sql");
                 $c->stash->{dbh}->do($down_sql);
                 $c->stash->{dbh}->do(
-                    "DELETE FROM db_migrate_tiny WHERE version ='$v';");
+                    "DELETE FROM $DB_TABLE WHERE version ='$v'");
+                print "done.\n";
             }
         }
     } elsif($current_version < $to_version) {
-        my @list = grep {$_ > $current_version} @dirs;
+        my @vers = grep {$_ > $current_version} @fs_versions;
         # Upgrade
-        for my $d (@list){
-            if ($d <= $to_version){
-                my $up_sql = read_file("$root/$d/up.sql");
+        for my $v (@vers){
+            if ($v <= $to_version){
+                print "Migrating up to $v...";
+                my $up_sql = read_file("$root/$v/up.sql");
                 $c->stash->{dbh}->do($up_sql);
                 $c->stash->{dbh}->do(
-                    "INSERT INTO db_migrate_tiny (version) VALUES ('$d');");
+                    "INSERT INTO $DB_TABLE (version) VALUES ($d)");
+                print "done.\n";
             }
         }
     }
     $c->stash->{dbh}->commit;
+    return '';
 }
 
-sub generate {
-    my $c = shift;
-    my $root = $c->stash->{migration_dir};
-    my $now = DateTime->now->epoch;
-    `mkdir $root/$now`;
-    `touch $root/$now/up.sql`;
-    `touch $root/$now/down.sql`;
-    say "Created migration $root/$now";
-}
-
-sub _migrations {
+sub _fs_versions {
     my ($c) = @_;
     my $root = $c->stash->{migration_dir};
-    return split /\n/, `ls -1 $root`;
+    return split /\n/, `ls -1 $root 2> /dev/null`;
+}
+
+sub _db_versions {
+    my ($c) = @_;
+    my $rows = $c->stash->{dbh}->selectcol_arrayref(
+        "SELECT version FROM $DB_TABLE");
+    return @$rows;
 }
