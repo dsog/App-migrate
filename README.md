@@ -1,8 +1,7 @@
 App-migrate
 ===========
 
-
-Easily migrate a database using timestamps.
+Easily migrate your database.
 
 #Set up
 
@@ -11,7 +10,7 @@ Easily migrate a database using timestamps.
 The setup process creates a very simple table in your database to maintain
 records of the migrations. The table looks as below:
 
-`CREATE TABLE db_migrate_tiny (version VARCHAR(20) PRIMARY KEY)`
+`CREATE TABLE db_migrate_tiny (version INT PRIMARY KEY)`
 
 #Migrate to latest migration
 
@@ -26,4 +25,4 @@ records of the migrations. The table looks as below:
 `migrate generate NAME`
 
 By default, migrations are generated in `migrations` directory. You can also
-pass `dir` option to specify a directory.
+pass `--dir` option to specify a directory.
